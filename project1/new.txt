@@ -1,0 +1,13 @@
+Makefile
+README
+README.md
+clemsh
+clemsh.c
+clemsh.o
+demo.c
+envshim.c
+new.txt
+out.txt
+parser.c
+parser.h
+parser.o
