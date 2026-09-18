@@ -1,1 +1,0 @@
-cat < input.txt | wc < tcp : localhost:8080 > tcp : localhost:9090

@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200112L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +10,9 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include "common.h"
+#include <sys/socket.h>
+#include <netdb.h>
+#include <err.h>
 // create the pipe before the child process. 
 
 
@@ -62,6 +67,7 @@ int main(int argc, char *argv[]){
                         close(pipe_fd[PIPE_WRITE_END]);
                         close(pipe_fd[PIPE_READ_END]);
                     }
+                    //FILES
                     if (pipeline.commands[i].input.type == REDIRECT_FILE){
                         // open a file descriptor and duplicate an input to the 
                         int fd_in = open(pipeline.commands[i].input.path, O_RDONLY);
@@ -81,58 +87,76 @@ int main(int argc, char *argv[]){
                         dup2(fd_out, STDOUT_FILENO);
                         close(fd_out);
                     }
-                    if (pipeline.commands[i].input.type == REDIRECT_TCP){
+                // SOCKETS
+                if (pipeline.commands[i].input.type == REDIRECT_TCP){
                         int sockfd;
-                        // int sendbytes;
-                        struct sockaddr_in servaddr;
+                        struct addrinfo hints, *pfirstResult;
+                        memset(&hints, 0, sizeof(hints));
+                        hints.ai_socktype = SOCK_STREAM;
                         // sockets are just file sescriptors and i can dup2 them like a file 
                         //instead of open do the client setup
-                        if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
-                            err_n_die("Error while creating the socket!");
-
-                        // bzero(&servaddr, sizeof(servaddr));
-                        memset(&servaddr, 0, sizeof(servaddr));
-                        servaddr.sin_family = AF_INET;          // use IPv4
-                        servaddr.sin_port = htons(pipeline.commands[i].output.port); /* the port my server is listening on */
-
-                        if (inet_pton(AF_INET, pipeline.commands[i].output.path, &servaddr.sin_addr) <= 0)
-                            err_n_die("inet_pton error for %s ", argv[1]);
-
-                        if (connect(sockfd, (SA *)&servaddr, sizeof(servaddr)) < 0)
+                        char port_str[6];
+                        snprintf(port_str, sizeof(port_str), "%u", pipeline.commands[i].input.port); //string port must be a string 
+                        int error = getaddrinfo(pipeline.commands[i].input.host, port_str, &hints, &pfirstResult);
+                        if(error){
+                            errx(1, "%s", gai_strerror(error));
+                        }
+                        struct addrinfo *curaddr;
+                         for (curaddr = pfirstResult; curaddr; curaddr = curaddr->ai_next){
+                            sockfd=socket(curaddr->ai_family, curaddr->ai_socktype, curaddr->ai_protocol);
+                            if (sockfd==-1) continue;
+                            if (connect(sockfd, curaddr->ai_addr, curaddr->ai_addrlen) == 0){
+                                break;
+                            }
+                            close(sockfd);
+                            sockfd = -1;
+                         }
+                         freeaddrinfo(pfirstResult);
+                        if (sockfd == -1){
                             err_n_die("connect failed!");
+                        }
                         //final part once socket is setup and connected
                         dup2(sockfd, STDIN_FILENO);
                         close(sockfd);
+                        
                     }
-                    if (pipeline.commands[i].output.type == REDIRECT_TCP){
+                if (pipeline.commands[i].output.type == REDIRECT_TCP){
                         int sockfd;
-                        // int sendbytes;
-                        struct sockaddr_in servaddr;
+                        struct addrinfo hints, *pfirstResult;
+                        memset(&hints, 0, sizeof(hints));
+                        hints.ai_socktype = SOCK_STREAM;
                         // sockets are just file sescriptors and i can dup2 them like a file 
                         //instead of open do the client setup
-                        if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
-                            err_n_die("Error while creating the socket!");
-
-                        // bzero(&servaddr, sizeof(servaddr));
-                        memset(&servaddr, 0, sizeof(servaddr));
-                        servaddr.sin_family = AF_INET;          // use IPv4
-                        servaddr.sin_port = htons(pipeline.commands[i].output.port); /* the port my server is listening on */
-
-                        if (inet_pton(AF_INET, pipeline.commands[i].output.path, &servaddr.sin_addr) <= 0)
-                            err_n_die("inet_pton error for %s ", argv[1]);
-
-                        if (connect(sockfd, (SA *)&servaddr, sizeof(servaddr)) < 0)
+                        char port_str[6];
+                        snprintf(port_str, sizeof(port_str), "%u", pipeline.commands[i].output.port);
+                        int error = getaddrinfo(pipeline.commands[i].output.host, port_str, &hints, &pfirstResult);
+                        if(error){
+                            errx(1, "%s", gai_strerror(error));
+                        }
+                        struct addrinfo *curaddr;
+                         for (curaddr = pfirstResult; curaddr; curaddr = curaddr->ai_next){
+                            sockfd=socket(curaddr->ai_family, curaddr->ai_socktype, curaddr->ai_protocol);
+                            if (sockfd==-1) continue;
+                            if (connect(sockfd, curaddr->ai_addr, curaddr->ai_addrlen) == 0){
+                                break;
+                            }
+                            close(sockfd);
+                            sockfd = -1;
+                         }
+                         freeaddrinfo(pfirstResult);
+                        if (sockfd == -1){
                             err_n_die("connect failed!");
+                        }
                         //final part once socket is setup and connected
                         dup2(sockfd, STDOUT_FILENO);
                         close(sockfd);
-                    }
 
+                    }
                     execvp(pipeline.commands[i].argv[0], pipeline.commands[i].argv);
-                    return EXIT_SUCCESS;
+                    exit(EXIT_SUCCESS);
                 }
+                
                 /* Parent only writes to the pipe. */
-                //this is wrong needs re evaluated
                 if (prev_fd != -1){
                     close(prev_fd);
                 }
