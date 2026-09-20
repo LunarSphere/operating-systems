@@ -47,7 +47,7 @@ int connect_with_timeout(const struct addrinfo *address, int timeout_ms) {
     // Attempt to connect
     int result = connect(sockfd, address->ai_addr, address->ai_addrlen);
     if (result == 0) {
-        // Connection succeeded immediately
+        // Connection succeeded 
         fcntl(sockfd, F_SETFL, flags); // Restore original flags
         return sockfd;
     } else if (errno != EINPROGRESS) {
@@ -57,7 +57,7 @@ int connect_with_timeout(const struct addrinfo *address, int timeout_ms) {
     }
     // Use poll to wait for the connection to complete or timeout
     struct pollfd pfd = { .fd = sockfd, .events = POLLOUT };
-    int poll_result = poll(&pfd, 1, timeout_ms * 1000);
+    int poll_result = poll(&pfd, 1, timeout_ms);
     if (poll_result <= 0) {
         // Timeout or error
         close(sockfd);
@@ -106,7 +106,13 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
         // create pipe if we are not last command | avoids unecessary pipe
         if ( i < pipeline->command_count - 1 && pipe(pipe_fd) == -1){
             perror("pipe");
-            _exit(EXIT_FAILURE);
+            if (prev_fd != -1){
+                close(prev_fd);
+            }
+            for (size_t j = 0; j < i; j++){
+                waitpid(pids[j], NULL, 0);
+            }
+            exit(EXIT_FAILURE);
         }
         // SHIM INTEGRATION:  log the start of the command
         //START < TAB > PIPELINE : STAGE < TAB >< COMMAND >
@@ -128,7 +134,17 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
         pids[i] = fork(); // creates a duplicate process | which is wiped by exec
         if (pids[i] == -1){
             perror("fork");
-            _exit(EXIT_FAILURE);
+            if (prev_fd != -1){
+                close(prev_fd);
+            }
+            if (i < pipeline->command_count - 1){
+                close(pipe_fd[PIPE_WRITE_END]);
+                close(pipe_fd[PIPE_READ_END]);
+            }
+            for (size_t j = 0; j < i; j++){
+                waitpid(pids[j], NULL, 0);
+            }
+            exit(EXIT_FAILURE);
         }
 
         if (pids[i] == 0){
@@ -272,8 +288,7 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
         int state; // to store info about state change
         struct timespec end;
         struct rusage usage;
-        pid_t waited;
-        wait4(pids[i], &state, 0, &usage); 
+        pid_t waited = wait4(pids[i], &state, 0, &usage); 
         while (waited == -1 && errno == EINTR) {
             waited = wait4(pids[i], &state, 0, &usage);
         }
@@ -282,37 +297,44 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
             pipeline_failed = 1;
             continue;
         }
+        //use clock gettime to get real time
         clock_gettime(CLOCK_MONOTONIC, &end);
+        double real_time = (end.tv_sec - start_times[i].tv_sec) + (end.tv_nsec - start_times[i].tv_nsec) / 1000000000.0;
+        double user_time = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0;
+        double system_time = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0;
+
         if (WIFEXITED(state)){
-            if (WEXITSTATUS(state) != 0){
+            int status = WEXITSTATUS(state);
+            if (status != 0){
                 pipeline_failed = 1;
             }
-            if (log != NULL){
-                //use clock gettime to get real time
-                double real_time = (end.tv_sec - start_times[i].tv_sec) + (end.tv_nsec - start_times[i].tv_nsec) / 1000000000.0;
-                double user_time = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0;
-                double system_time = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0;
+            if (log != NULL){   
                 // two exit options
                 // EXIT < TAB > PIPELINE : STAGE < TAB >< REALTIMEinMS >< TAB >< SYSTIMEinMS >< TAB >< USERTIMEinMS >< TAB > NORMAL < TAB >< TAB >< STATUS >
                 // EXIT < TAB > PIPELINE : STAGE < TAB >< REALTIMEinMS >< TAB >< SYSTIMEinMS >< TAB >< USERTIMEinMS >< TAB > CRASH < TAB >< TAB >< STATUS >
                 // WIFEXITED returns true if a child exited normally
-                if (WIFEXITED(state)){
-                    fprintf(log, "EXIT\t%d:%zu\t%.6f\t%.6f\t%.6f\tNORMAL\t\t%d\n", pipeline_number, i, real_time * 1000, system_time * 1000, user_time * 1000, WEXITSTATUS(state));
-                }
+                fprintf(log, "EXIT\t%d:%zu\t%.6f\t%.6f\t%.6f\tNORMAL\t\t%d\n", pipeline_number, i, real_time * 1000, system_time * 1000, user_time * 1000, WEXITSTATUS(state));
                 // WIFSIGNALED returns true if a child process crashed
-                else if (WIFSIGNALED(state)){
-                    fprintf(log, "EXIT\t%d:%zu\t%.6f\t%.6f\t%.6f\tCRASH\t\t%d\n", pipeline_number, i, real_time * 1000, system_time * 1000, user_time * 1000, WTERMSIG(state));
-                }
                 fflush(log);
             }
         }
+        else if (WIFSIGNALED(state)){
+            fprintf(log, "EXIT\t%d:%zu\t%.6f\t%.6f\t%.6f\tCRASH\t\t%d\n", pipeline_number, i, real_time * 1000, system_time * 1000, user_time * 1000, WTERMSIG(state));
+        }
+            fflush(log);
     }
     return pipeline_failed;
 }
 
+// handle control c 
+static volatile sig_atomic_t user_wants_to_exit;
+static void  handle_ctrl_c(int sig) {
+    user_wants_to_exit = 1;
+}
 
 // this c thing is pretty cool
 int main(int argc, char *argv[]){
+    signal(SIGINT, handle_ctrl_c);
     //interactive mode
     char input[9999];
     char *log_env = getenv("CLEMSHLOG");
@@ -322,7 +344,7 @@ int main(int argc, char *argv[]){
     }
     int pipeline_number = 0;
     if (argc == 1) {
-        while(1){
+        while(!user_wants_to_exit){
             // create pointers for pipeline and error
             Pipeline pipeline;
             ParseError error;
@@ -330,8 +352,10 @@ int main(int argc, char *argv[]){
             fflush(stdout); // we use this to immediately write to the buffer
             // error checking for fgets
             if (fgets(input, sizeof(input), stdin) == NULL) {
-                // if read error from fgets
-                fprintf(stderr, "Error reading input\n");
+                if (feof(stdin)) {
+                    break; 
+                }
+                perror("fgets");
                 return EXIT_FAILURE;
             }
             if (strlen(input) > 1025){
@@ -368,7 +392,7 @@ int main(int argc, char *argv[]){
         }
         int pipeline_number = 0;
         int batch_failed = 0;
-        while (fgets(input, sizeof(input), batch) != NULL){
+        while (fgets(input, sizeof(input), batch) != NULL && !user_wants_to_exit) {
             Pipeline pipeline;
             ParseError error;
             if (strlen(input) > 1025){

@@ -22,12 +22,12 @@ make
 make clean
 
 ## run in interactive mode
-./clemsh.c
+./clemsh
 
 ## to run in batch mode
 create a .txt file with commands separated as newlines
 
-./clemsh.c {filename}.txt
+./clemsh {filename}.txt
 
 ## Notes
 This parser only builds a Pipeline data structure that represents the command pipeline typed in the by the user. It does not execute commands, create sockets, open files, or set up pipes for you. You have to do that part.
