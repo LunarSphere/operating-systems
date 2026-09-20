@@ -64,10 +64,9 @@ int putenv(char *string){
             char *value = equal_sign + 1;
             log_event("ENVWRITE", value, name);
             *equal_sign = '='; 
+        }else{
+            log_event("ENVWRITE", "", copy);
         }
-    }
-    else{
-        log_event("ENVWRITE", "", copy);
     }
     free(copy);
     //return result of putenv

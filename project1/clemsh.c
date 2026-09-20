@@ -17,17 +17,63 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/resource.h>
-// create the pipe before the child process. 
+#include <errno.h>
+#include <poll.h>
 
+// create the pipe before the child process. 
 // you need to be able to redirect inputs into a pipe. 
 #define PIPE_READ_END 0
 #define PIPE_WRITE_END 1
-
-
-
 // SHIM INTEGRATION: set paths
 const char *log_path = "clemshlog.txt";
 const char *shim_path = "./envshim.so";
+
+// SHELL EXECUTION: function to handle tcp connection with timeout
+int connect_with_timeout(const struct addrinfo *address, int timeout_ms) {
+    int sockfd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+    if (sockfd == -1) {
+        return -1;
+    }
+    // Set the socket to non-blocking mode
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags == -1) {
+        close(sockfd);
+        return -1;
+    }
+    if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        close(sockfd);
+        return -1;
+    }
+    // Attempt to connect
+    int result = connect(sockfd, address->ai_addr, address->ai_addrlen);
+    if (result == 0) {
+        // Connection succeeded immediately
+        fcntl(sockfd, F_SETFL, flags); // Restore original flags
+        return sockfd;
+    } else if (errno != EINPROGRESS) {
+        // An error occurred
+        close(sockfd);
+        return -1;
+    }
+    // Use poll to wait for the connection to complete or timeout
+    struct pollfd pfd = { .fd = sockfd, .events = POLLOUT };
+    int poll_result = poll(&pfd, 1, timeout_ms * 1000);
+    if (poll_result <= 0) {
+        // Timeout or error
+        close(sockfd);
+        return -1;
+    }
+    // Check for errors on the socket
+    int so_error;
+    socklen_t len = sizeof(so_error);
+    if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0 || so_error != 0) {
+        close(sockfd);
+        return -1;
+    }
+    // Restore original flags and return the connected socket
+    fcntl(sockfd, F_SETFL, flags);
+    return sockfd;
+}
 
 
 // SHIM INTEGRATION: file for logging commands and env reads/writes
@@ -49,7 +95,8 @@ FILE* createlog(){
 }
 
 //SHELL EXECUTION: execute a pipeline of commands
-void execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
+int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
+    int pipeline_failed = 0; // indicate pipeline failure 
     // a file descriptor is a interger that a c can use to access a file or socket.  
     int pipe_fd[2]; // pipes create a read and write file descriptor
     pid_t pids[pipeline->command_count]; // need to support some number of commands
@@ -59,8 +106,7 @@ void execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
         // create pipe if we are not last command | avoids unecessary pipe
         if ( i < pipeline->command_count - 1 && pipe(pipe_fd) == -1){
             perror("pipe");
-            close(prev_fd);
-            return;
+            _exit(EXIT_FAILURE);
         }
         // SHIM INTEGRATION:  log the start of the command
         //START < TAB > PIPELINE : STAGE < TAB >< COMMAND >
@@ -82,8 +128,7 @@ void execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
         pids[i] = fork(); // creates a duplicate process | which is wiped by exec
         if (pids[i] == -1){
             perror("fork");
-            close(prev_fd);
-            return;
+            _exit(EXIT_FAILURE);
         }
 
         if (pids[i] == 0){
@@ -92,7 +137,7 @@ void execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
                 // dup2 duplicattes a file descriptor and assigns it a user defined number 
                 if (dup2(prev_fd, STDIN_FILENO) == -1){
                     perror("dup2");
-                    exit(EXIT_FAILURE);
+                    _exit(EXIT_FAILURE);
                 }
                 close(prev_fd);
             }
@@ -100,7 +145,7 @@ void execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
             if (i < pipeline->command_count - 1){ 
                 if (dup2(pipe_fd[PIPE_WRITE_END], STDOUT_FILENO) == -1){
                     perror("dup2");
-                    exit(EXIT_FAILURE);
+                    _exit(EXIT_FAILURE);
                 }
                 close(pipe_fd[PIPE_WRITE_END]);
                 close(pipe_fd[PIPE_READ_END]);
@@ -122,12 +167,12 @@ void execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
                 int fd_in = open(pipeline->commands[i].input.path, O_RDONLY);
                 if (fd_in == -1){
                     perror("open");
-                    exit(EXIT_FAILURE);
+                    _exit(EXIT_FAILURE);
                 }
                 // if possible duplicate its contnet to STDIN
                 if (dup2(fd_in, STDIN_FILENO) == -1){
                     perror("dup2");
-                    exit(EXIT_FAILURE);
+                    _exit(EXIT_FAILURE);
                 }
                 close(fd_in);
             }
@@ -136,17 +181,17 @@ void execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
                 int fd_out = open(pipeline->commands[i].output.path, O_WRONLY | O_CREAT | O_TRUNC, 0664);
                 if (fd_out == -1){
                     perror("open");
-                    exit(EXIT_FAILURE);
+                    _exit(EXIT_FAILURE);
                 }
                 if (dup2(fd_out, STDOUT_FILENO) == -1){
                     perror("dup2");
-                    exit(EXIT_FAILURE);
+                    _exit(EXIT_FAILURE);
                 }
                 close(fd_out);
             }
         // SOCKETS Conceptually the same as above but you have to jump through more hoops to write to a socket
         if (pipeline->commands[i].input.type == REDIRECT_TCP){
-                int sockfd;
+                int sockfd = -1;
                 struct addrinfo hints, *pfirstResult;
                 memset(&hints, 0, sizeof(hints));
                 hints.ai_socktype = SOCK_STREAM;
@@ -156,66 +201,61 @@ void execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
                 snprintf(port_str, sizeof(port_str), "%u", pipeline->commands[i].input.port); //string port must be a string 
                 int error = getaddrinfo(pipeline->commands[i].input.host, port_str, &hints, &pfirstResult);
                 if(error){
-                    errx(1, "%s", gai_strerror(error));
+                    fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(error));
+                    _exit(EXIT_FAILURE);
                 }
                 struct addrinfo *curaddr;
-                    for (curaddr = pfirstResult; curaddr; curaddr = curaddr->ai_next){
-                    sockfd=socket(curaddr->ai_family, curaddr->ai_socktype, curaddr->ai_protocol);
-                    if (sockfd==-1) continue;
-                    if (connect(sockfd, curaddr->ai_addr, curaddr->ai_addrlen) == 0){
+                for (curaddr = pfirstResult; curaddr; curaddr = curaddr->ai_next){
+                    sockfd = connect_with_timeout(curaddr, 3000); // 5 second timeout
+                    if (sockfd != -1){
                         break;
                     }
-                    close(sockfd);
-                    sockfd = -1;
-                    }
-                    freeaddrinfo(pfirstResult);
+                }
+                freeaddrinfo(pfirstResult);
                 if (sockfd == -1){
-                    err_n_die("connect failed!");
+                    fprintf(stderr, "connect failed!\n");
+                    _exit(EXIT_FAILURE);
                 }
                 //final part once socket is setup and connected
                 if (dup2(sockfd, STDIN_FILENO) == -1){
                     perror("dup2");
-                    exit(EXIT_FAILURE);
+                    _exit(EXIT_FAILURE);
                 }
                 close(sockfd);
             }
         if (pipeline->commands[i].output.type == REDIRECT_TCP){
-                int sockfd;
-                struct addrinfo hints, *pfirstResult;
-                memset(&hints, 0, sizeof(hints));
-                hints.ai_socktype = SOCK_STREAM;
-                // sockets are just file sescriptors and i can dup2 them like a file 
-                //instead of open do the client setup
-                char port_str[6];
-                snprintf(port_str, sizeof(port_str), "%u", pipeline->commands[i].output.port);
-                int error = getaddrinfo(pipeline->commands[i].output.host, port_str, &hints, &pfirstResult);
-                if(error){
-                    errx(1, "%s", gai_strerror(error));
-                }
-                struct addrinfo *curaddr;
-                    for (curaddr = pfirstResult; curaddr; curaddr = curaddr->ai_next){
-                    sockfd=socket(curaddr->ai_family, curaddr->ai_socktype, curaddr->ai_protocol);
-                    if (sockfd==-1) continue;
-                    if (connect(sockfd, curaddr->ai_addr, curaddr->ai_addrlen) == 0){
-                        break;
-                    }
-                    close(sockfd);
-                    sockfd = -1;
-                    }
-                    freeaddrinfo(pfirstResult);
-                if (sockfd == -1){
-                    err_n_die("connect failed!");
-                }
-                //final part once socket is setup and connected
-                if (dup2(sockfd, STDOUT_FILENO) == -1){
-                    perror("dup2");
-                    exit(EXIT_FAILURE);
-                }
-                close(sockfd);
+            int sockfd = -1;
+            struct addrinfo hints, *pfirstResult;
+            memset(&hints, 0, sizeof(hints));
+            hints.ai_socktype = SOCK_STREAM;
+            char port_str[6];
+            snprintf(port_str, sizeof(port_str), "%u", pipeline->commands[i].output.port); //string port must be a string 
+            int error = getaddrinfo(pipeline->commands[i].output.host, port_str, &hints, &pfirstResult);
+            if(error){
+                fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(error));
+                _exit(EXIT_FAILURE);
             }
-            execvp(pipeline->commands[i].argv[0], pipeline->commands[i].argv);
-            perror("execvp");
-            exit(EXIT_FAILURE); 
+            struct addrinfo *curaddr;
+            for (curaddr = pfirstResult; curaddr; curaddr = curaddr->ai_next){
+                sockfd = connect_with_timeout(curaddr, 3000); // 5 second timeout
+                if (sockfd != -1){
+                    break;
+                }
+            }
+            freeaddrinfo(pfirstResult);
+            if (sockfd == -1){
+                fprintf(stderr, "connect failed!\n");
+                _exit(EXIT_FAILURE);
+            }
+            if (dup2(sockfd, STDOUT_FILENO) == -1){
+                perror("dup2");
+                _exit(EXIT_FAILURE); // underscore exit closes fds and sockets
+            }
+            close(sockfd);
+        }
+        execvp(pipeline->commands[i].argv[0], pipeline->commands[i].argv);
+        perror("execvp");
+        _exit(EXIT_FAILURE);
         }
         /* Parent only writes to the pipe. */ 
         if (prev_fd != -1){
@@ -232,27 +272,42 @@ void execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
         int state; // to store info about state change
         struct timespec end;
         struct rusage usage;
+        pid_t waited;
         wait4(pids[i], &state, 0, &usage); 
+        while (waited == -1 && errno == EINTR) {
+            waited = wait4(pids[i], &state, 0, &usage);
+        }
+        if (waited == -1) {
+            perror("wait4");
+            pipeline_failed = 1;
+            continue;
+        }
         clock_gettime(CLOCK_MONOTONIC, &end);
-        if (log != NULL){
-            //use clock gettime to get real time
-            double real_time = (end.tv_sec - start_times[i].tv_sec) + (end.tv_nsec - start_times[i].tv_nsec) / 1000000000.0;
-            double user_time = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0;
-            double system_time = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0;
-            // two exit options
-            // EXIT < TAB > PIPELINE : STAGE < TAB >< REALTIMEinMS >< TAB >< SYSTIMEinMS >< TAB >< USERTIMEinMS >< TAB > NORMAL < TAB >< TAB >< STATUS >
-            // EXIT < TAB > PIPELINE : STAGE < TAB >< REALTIMEinMS >< TAB >< SYSTIMEinMS >< TAB >< USERTIMEinMS >< TAB > CRASH < TAB >< TAB >< STATUS >
-            // WIFEXITED returns true if a child exited normally
-            if (WIFEXITED(state)){
-                fprintf(log, "EXIT\t%d:%zu\t%.6f\t%.6f\t%.6f\tNORMAL\t\t%d\n", pipeline_number, i, real_time * 1000, system_time * 1000, user_time * 1000, WEXITSTATUS(state));
+        if (WIFEXITED(state)){
+            if (WEXITSTATUS(state) != 0){
+                pipeline_failed = 1;
             }
-            // WIFSIGNALED returns true if a child process crashed
-            else if (WIFSIGNALED(state)){
-                fprintf(log, "EXIT\t%d:%zu\t%.6f\t%.6f\t%.6f\tCRASH\t\t%d\n", pipeline_number, i, real_time * 1000, system_time * 1000, user_time * 1000, WTERMSIG(state));
+            if (log != NULL){
+                //use clock gettime to get real time
+                double real_time = (end.tv_sec - start_times[i].tv_sec) + (end.tv_nsec - start_times[i].tv_nsec) / 1000000000.0;
+                double user_time = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0;
+                double system_time = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0;
+                // two exit options
+                // EXIT < TAB > PIPELINE : STAGE < TAB >< REALTIMEinMS >< TAB >< SYSTIMEinMS >< TAB >< USERTIMEinMS >< TAB > NORMAL < TAB >< TAB >< STATUS >
+                // EXIT < TAB > PIPELINE : STAGE < TAB >< REALTIMEinMS >< TAB >< SYSTIMEinMS >< TAB >< USERTIMEinMS >< TAB > CRASH < TAB >< TAB >< STATUS >
+                // WIFEXITED returns true if a child exited normally
+                if (WIFEXITED(state)){
+                    fprintf(log, "EXIT\t%d:%zu\t%.6f\t%.6f\t%.6f\tNORMAL\t\t%d\n", pipeline_number, i, real_time * 1000, system_time * 1000, user_time * 1000, WEXITSTATUS(state));
+                }
+                // WIFSIGNALED returns true if a child process crashed
+                else if (WIFSIGNALED(state)){
+                    fprintf(log, "EXIT\t%d:%zu\t%.6f\t%.6f\t%.6f\tCRASH\t\t%d\n", pipeline_number, i, real_time * 1000, system_time * 1000, user_time * 1000, WTERMSIG(state));
+                }
+                fflush(log);
             }
-            fflush(log);
         }
     }
+    return pipeline_failed;
 }
 
 
@@ -280,7 +335,7 @@ int main(int argc, char *argv[]){
                 return EXIT_FAILURE;
             }
             if (strlen(input) > 1025){
-                fprintf(stderr, "inputs must be < 1024 chars");
+                fprintf(stderr, "inputs must be < 1024 chars\n");
                 continue;
             }
             if (pipeline_parse(input, &pipeline, &error) != PARSE_SUCCESS){
@@ -289,7 +344,11 @@ int main(int argc, char *argv[]){
                 pipeline_free(&pipeline);
                 continue; // next loop iteration
             }
-
+            // account for empty pipelines
+            if (pipeline.command_count == 0){
+                pipeline_free(&pipeline);
+                continue;
+            }
             execute_pipeline(&pipeline, log, pipeline_number);
             pipeline_free(&pipeline);
             pipeline_number++;
@@ -308,12 +367,12 @@ int main(int argc, char *argv[]){
             return EXIT_FAILURE;
         }
         int pipeline_number = 0;
-        // create pointers for pipeline and error
+        int batch_failed = 0;
         while (fgets(input, sizeof(input), batch) != NULL){
             Pipeline pipeline;
             ParseError error;
-            if (strlen(input) > 1024){
-                fprintf(stderr, "inputs must be < 1024 chars");
+            if (strlen(input) > 1025){
+                fprintf(stderr, "inputs must be < 1024 chars\n");
                 continue;
             }
             if (pipeline_parse(input, &pipeline, &error) != PARSE_SUCCESS){
@@ -322,7 +381,14 @@ int main(int argc, char *argv[]){
                 pipeline_free(&pipeline);
                 continue; // next loop iteration
             }
-        execute_pipeline(&pipeline, log, pipeline_number);
+            // account for empty pipelines
+            if (pipeline.command_count == 0){
+                pipeline_free(&pipeline);
+                continue;
+            }
+            if (execute_pipeline(&pipeline, log, pipeline_number) != 0){
+                batch_failed = 1;
+            }
         pipeline_free(&pipeline);
         pipeline_number++;
         }
@@ -330,7 +396,12 @@ int main(int argc, char *argv[]){
         if (log != NULL){
             fclose(log);
         }
-        return EXIT_SUCCESS;
+        if (batch_failed){
+            return EXIT_FAILURE;
+        }
+        else{
+            return EXIT_SUCCESS;
+        }
     }
     else{
         fprintf(stderr, "usage: %s <pipeline to parse>\n", argv[0]);
