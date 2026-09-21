@@ -326,15 +326,9 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
     return pipeline_failed;
 }
 
-// handle control c 
-static volatile sig_atomic_t user_wants_to_exit;
-static void  handle_ctrl_c(int sig) {
-    user_wants_to_exit = 1;
-}
 
 // this c thing is pretty cool
 int main(int argc, char *argv[]){
-    signal(SIGINT, handle_ctrl_c);
     //interactive mode
     char input[9999];
     char *log_env = getenv("CLEMSHLOG");
@@ -344,7 +338,7 @@ int main(int argc, char *argv[]){
     }
     int pipeline_number = 0;
     if (argc == 1) {
-        while(!user_wants_to_exit){
+        while(1){
             // create pointers for pipeline and error
             Pipeline pipeline;
             ParseError error;
@@ -392,7 +386,7 @@ int main(int argc, char *argv[]){
         }
         int pipeline_number = 0;
         int batch_failed = 0;
-        while (fgets(input, sizeof(input), batch) != NULL && !user_wants_to_exit) {
+        while (fgets(input, sizeof(input), batch) != NULL) {
             Pipeline pipeline;
             ParseError error;
             if (strlen(input) > 1025){
