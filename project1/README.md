@@ -41,11 +41,15 @@ For this project you do **not** need to change the parser at all. Just use it. Y
 
 ## KNOWN PROBLEMS
 explain any known errors or limiations to the code 
+- file pathing is relative
+- on the current autograder submission shims score 0/0 despite appearing to create and populate a clemshlog.txt file
+- I think my error handling is pretty robust but it consisitently fails the autograder
+- my error handling strat is to just check every system or lib call and attatch a stderr message to it if its a point of failure. 
+
 
 ## DESIGN
 Explain repo structure
 
-common.c/h -> was used during our lecture on tcp/udp to get code working 
 parser.c/h -> code provided by Dr. Sorber to abstract input parsing | Thank god.
 envshim.so -> generates during compilation | this is a shared object combined with LD preload lets system loader load the shim before other librarires | enables us to intercept commands with SHIMS
 envshim.c -> Intercepts environment system calls and logs them | self analyzing shell part
